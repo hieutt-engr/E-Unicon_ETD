@@ -1,0 +1,13 @@
+data/
+save/
+pytorch-wgan/
+logs/
+metrics/
+results/
+notebooks/prepared/
+notebooks/prepared_etd
+notebooks/data/
+# others
+__pycache__/
+.vscode/
+networks/__pycache__/
