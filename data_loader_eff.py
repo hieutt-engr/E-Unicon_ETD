@@ -70,7 +70,6 @@ def data_preparing(config, args):
         is_train=True,
         do_instance_norm=True,
         target_size=(64, 64),
-        data_name='CER'
     )
     # classifier dùng 1 view để tránh tuple/list ở loader
     train_ds_classifier = DatasetPrepare_ETD(
@@ -84,7 +83,6 @@ def data_preparing(config, args):
         is_train=True,
         do_instance_norm=True,
         target_size=(64, 64),
-        data_name='CER'
     )
     test_dataset = DatasetPrepare_ETD(
         root_dir=config.root_dir,
@@ -97,7 +95,6 @@ def data_preparing(config, args):
         is_train=False,
         do_instance_norm=True,
         target_size=(64, 64),
-        data_name='CER'
     )
 
     # --- info print ---

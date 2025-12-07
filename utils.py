@@ -269,25 +269,19 @@ def get_universum_etd(images: torch.Tensor, labels: torch.Tensor, opt) -> torch.
     lam = max(0.0, min(1.0, lam))
     mix_mode = str(getattr(opt, 'mix', 'mixup')).lower()
 
-    # --- chọn chỉ mục khác lớp (vectorized) ---
-    # Thử một hoán vị ngẫu nhiên; nếu còn trùng lớp, sửa lại các vị trí trùng
     perm = torch.randperm(B, device=device)
     same = (labels == labels[perm])
     if same.all():
-        # batch 1 lớp hoặc hoán vị đụng lớp toàn bộ -> xoay 1 bước (nếu B>1)
         if B > 1:
             perm = torch.roll(torch.arange(B, device=device), shifts=1, dims=0)
         else:
-            perm = torch.arange(B, device=device)  # B==1, đành dùng chính nó
+            perm = torch.arange(B, device=device)  # B==1
 
-    # Nếu vẫn còn vài phần tử trùng lớp (batch có >1 lớp nhưng perm xui):
     tries = 0
     while same.any() and tries < 5 and B > 1:
-        idx_bad = same.nonzero(as_tuple=False).squeeze(1)            # các vị trí bị trùng
-        # random re-assign chỉ những vị trí này
+        idx_bad = same.nonzero(as_tuple=False).squeeze(1)        
         cand = torch.randperm(B, device=device)
         perm[idx_bad] = cand[idx_bad]
-        # không để i == perm[i]
         collide = (perm == torch.arange(B, device=device))
         perm[collide] = (perm[collide] + 1) % B
         same = (labels == labels[perm])
@@ -299,9 +293,7 @@ def get_universum_etd(images: torch.Tensor, labels: torch.Tensor, opt) -> torch.
     if mix_mode == 'mixup':
         universum = lam * other + (1.0 - lam) * images  # [B,1,H,W]
     elif mix_mode == 'cutmix' and B > 0:
-        # rand_bbox: vùng chèn theo lambda
         def rand_bbox(H, W, lam_val):
-            # area giữ ~lam_val, clamp để không quá bé
             lam_clip = float(lam_val)
             lam_clip = min(max(lam_clip, 0.0), 1.0)
             cut_rat = (1.0 - lam_clip) ** 0.5
@@ -316,15 +308,36 @@ def get_universum_etd(images: torch.Tensor, labels: torch.Tensor, opt) -> torch.
             return y1, y2, x1, x2
 
         universum = other.clone()
-        # áp cho từng mẫu (đơn giản, ổn định)
         for b in range(B):
             y1, y2, x1, x2 = rand_bbox(H, W, lam)
             universum[b, :, y1:y2, x1:x2] = images[b, :, y1:y2, x1:x2]
     else:
-        # mode không hợp lệ -> fallback mixup
         universum = lam * other + (1.0 - lam) * images
 
     return universum.to(dtype=images.dtype, device=device)
+
+@torch.no_grad()
+def generate_prototype_universum(features, prototypes_layer, alpha=0.5):
+    sim_scores = prototypes_layer(features) 
+    
+    _, assigned_idxs = torch.max(sim_scores, dim=1)
+    
+    B, num_proto = sim_scores.shape
+    neg_idxs = torch.randint(0, num_proto, (B,), device=features.device)
+    
+    mask_collision = (neg_idxs == assigned_idxs)
+    neg_idxs[mask_collision] = (neg_idxs[mask_collision] + 1) % num_proto
+    
+    proto_weights = prototypes_layer.weight.data # [K, D]
+    c_neg = F.embedding(neg_idxs, proto_weights) # [B, D]
+    
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1-lam)
+    
+    z_universum = lam * features + (1 - lam) * c_neg
+    z_universum = F.normalize(z_universum, dim=1)
+    
+    return z_universum.detach()
 
 def save_model(model, optimizer, opt, epoch, save_file):
     print('==> Saving...')

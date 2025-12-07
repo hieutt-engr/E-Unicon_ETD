@@ -10,13 +10,15 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, recall_score, f1_score, precision_score, confusion_matrix
+from sklearn.cluster import KMeans
+
 from logger import Logger
 from networks.transformer_model.scheduler import CosineWarmupScheduler
-from networks.efficient_net import ConEfficientNet, LinearClassifier
-from losses import UniConLoss_Standard, recon_loss, vicreg_loss
+from networks.efficient_lrl_prototype import ConEfficientNet, LinearClassifier
+from losses import UniConLoss_ETD, recon_loss, vicreg_loss, ProtoNCELoss
 from config import Config, prepare_fin, parser_process
-from utils import AverageMeter, get_universum_standard, save_model
-from data_loader_cer import data_preparing
+from utils import AverageMeter, save_model, generate_prototype_universum
+from data_loader_eff import data_preparing
 
 warnings.filterwarnings("ignore")
 
@@ -28,7 +30,7 @@ layout = {
         "accuracy": ["Multiline", ["accuracy/train", "accuracy/test"]],
     },
 }
-
+    
 def set_requires_grad(module: nn.Module, flag: bool):
     for p in module.parameters():
         p.requires_grad = flag
@@ -40,12 +42,12 @@ def evaluate(model, classifier, test_loader, device):
     losses = AverageMeter()
     all_pred, all_true = [], []
 
-    for images, labels in test_loader:                 # single-view
-        x = images.float().to(device)                  # [B,1,64,64]
+    for images, labels in test_loader:
+        x = images.float().to(device)
         y = labels.to(device)
 
-        feat = model(x)                                # [B,128]
-        logits = classifier(feat)                      # [B,K]
+        feat = model(x)
+        logits = classifier(feat)
         loss = ce(logits, y)
         losses.update(loss.item(), y.size(0))
 
@@ -57,7 +59,7 @@ def evaluate(model, classifier, test_loader, device):
     f1   = f1_score(y_true, y_pred, average='weighted')
     prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
     rec  = recall_score(y_true, y_pred, average='weighted')
-    cm   = confusion_matrix(y_true, y_pred, labels=np.arange(config.n_classes))
+    cm   = confusion_matrix(y_true, y_pred)
 
     print(f'[VAL] CE: {losses.avg:.4f} | Acc: {acc*100:.2f} | F1: {f1:.4f} | P: {prec:.4f} | R: {rec:.4f}')
     print('[VAL] Confusion Matrix:\n', cm)
@@ -75,23 +77,25 @@ if __name__ == '__main__':
         logger = Logger('./logs/transformer_test', layout)
         print("Test mode")
 
-    # ----- Data loader -----
     train_loader, train_classifier_loader, test_loader = data_preparing(config, args)
     print('finish load data')
 
-    # ----- Model -----
     assert config.model == 'efficientnet', "This script supports efficientnet only."
+    
+    num_prototypes = 1000
     model = ConEfficientNet(
         embedding_dim=1792, feat_dim=128, head='mlp',
-        pretrained=getattr(config, 'pretrained', False)
+        pretrained=getattr(config, 'pretrained', False),
+        num_prototypes=num_prototypes
     ).to(config.device)
+    
     classifier = LinearClassifier(input_dim=128, num_classes=config.n_classes).to(config.device)
 
-    # ----- Losses -----
     if str(config.method).lower() == 'unicon':
-        con_loss = UniConLoss_Standard(temperature=config.temp).to(config.device)
+        con_loss = UniConLoss_ETD(temperature=config.temp).to(config.device)
 
-    # ----- Opt/Sched -----
+    proto_loss_fn = ProtoNCELoss(temperature=0.1).to(config.device)
+
     opt_enc = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     sch_enc = CosineWarmupScheduler(opt_enc, warmup=50, max_iters=max(1, config.epoch_num * len(train_loader)))
 
@@ -107,55 +111,73 @@ if __name__ == '__main__':
         max_iters=max(1, total_phase2_epochs * max(1, len(train_classifier_loader)))
     )
 
-    # ===== Training loop =====
     start_epoch = -1
     os.makedirs(config.model_save_path, exist_ok=True)
 
     for epoch in range(start_epoch + 1, config.epoch_num):
         print(f'\n=== Epoch {epoch} / {config.epoch_num-1} ==='); sys.stdout.flush()
 
-        # ---------- Phase 1: Contrastive (two-crop) ----------
+        if epoch == 0 or epoch % 5 == 0:
+            print("Clustering to update prototypes...")
+            model.eval()
+            all_feats = []
+            with torch.no_grad():
+                for images, _ in train_loader:
+                    img = images[0].float().to(config.device)
+                    feat = model(img)
+                    all_feats.append(feat.cpu().numpy())
+            
+            all_feats = np.concatenate(all_feats, axis=0)
+            
+            kmeans = KMeans(n_clusters=num_prototypes, random_state=epoch).fit(all_feats)
+            
+            new_centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float).to(config.device)
+            new_centers = F.normalize(new_centers, dim=1)
+            model.prototypes.weight.data.copy_(new_centers)
+            print("Prototypes updated.")
+
         set_requires_grad(model, True); model.train()
+        model.normalize_prototypes()
+        
         running_loss, n_samples = 0.0, 0
 
         for i, (images, labels) in enumerate(train_loader):
-            image1, image2 = images[0].float().to(config.device), images[1].float().to(config.device)
-            labels = labels.to(config.device)
+            q, k = images[0].float().to(config.device), images[1].float().to(config.device)
+            y = labels.to(config.device)
 
-            # DEBUG 1 lần đầu
-            if epoch == start_epoch + 1 and i == 0:
-                print("\n[DEBUG] Epoch 1, Iter 0")
-                print("image1 shape:", image1.shape, "dtype:", image1.dtype,
-                    "min:", image1.min().item(), "max:", image1.max().item())
-                print("image2 shape:", image2.shape, "dtype:", image2.dtype,
-                    "min:", image2.min().item(), "max:", image2.max().item())
-                print("image1[0, 0, :5, :5]:\n", image1[0, 0, :5, :5].cpu())
-                print("image2[0, 0, :5, :5]:\n", image2[0, 0, :5, :5].cpu())
+            z1, h1, x_hat_q, p_q = model.forward_lrl(q)
+            z2, h2, x_hat_k, p_k = model.forward_lrl(k)
+            feats = torch.stack([z1, z2], dim=1)
 
-            images = torch.cat([image1, image2], dim=0)
+            z_u = generate_prototype_universum(z1, model.prototypes, alpha=0.5)
 
-            universum = get_universum_standard(images, labels, config)
-            uni_features = model(universum)
-            bsz = labels.size(0)
+            L_uni = con_loss(features=feats, labels=y, universum=z_u)
 
-            features = model(images)
-            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-            
-            # ====== Losses ======
-            # SupCon + Universum
-            loss = con_loss(features=features, labels=labels, universum=uni_features)
+            L_rec = 0.0
+            if x_hat_q is not None:
+                L_rec = recon_loss(x_hat_q, q)
+
+            L_vic = 0.0
+            if p_q is not None and p_k is not None:
+                L_vic = vicreg_loss(p_q, p_k)
+
+            L_proto = (proto_loss_fn(z1, model.prototypes) + proto_loss_fn(z2, model.prototypes)) / 2
+
+            alpha_loss = 0.2
+            beta_loss = 0.5
+            gamma_loss = 0.5
+            loss = L_uni + alpha_loss * L_rec + beta_loss * L_vic + gamma_loss * L_proto
 
             opt_enc.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt_enc.step()
-            if sch_enc is not None:
-                sch_enc.step()
+            sch_enc.step()
+            
+            model.normalize_prototypes()
 
-            # logging
-            running_loss += loss.item() * bsz
-            n_samples += bsz
+            bs = y.size(0)
+            running_loss += loss.item() * bs
+            n_samples += bs
 
             if i % 100 == 0:
                 print(f'[P1] it {i:05d} | loss {loss.item():.4f}')
@@ -163,8 +185,6 @@ if __name__ == '__main__':
 
         print(f'[P1] Train Loss (contrastive): {running_loss / max(1, n_samples):.4f}')
 
-
-        # ---------- Phase 2: Classifier ----------
         if epoch >= config.epoch_start_classifier:
             model.eval(); set_requires_grad(model, False)
             classifier.train()
@@ -172,14 +192,13 @@ if __name__ == '__main__':
             run_ce, correct, total = 0.0, 0, 0
 
             for i, (images, labels) in enumerate(train_classifier_loader):
-                # loader classifier là single-view, nhưng vẫn phòng trường hợp tuple
                 x = images[0] if isinstance(images, (tuple, list)) else images
                 x = x.float().to(config.device)
                 y = labels.to(config.device)
 
                 with torch.no_grad():
-                    feat = model(x)                        # [B,128]
-                logits = classifier(feat)                  # [B,K]
+                    feat = model(x)
+                logits = classifier(feat)
                 ce = F.cross_entropy(logits, y)
 
                 opt_cls.zero_grad(set_to_none=True)
@@ -199,7 +218,6 @@ if __name__ == '__main__':
 
             print(f'[P2] Train CE: {run_ce/max(1,total):.4f} | Acc: {correct/max(1,total):.4f}')
 
-            # Validate ngay sau Phase 2
             _ = evaluate(model, classifier, test_loader, config.device)
 
             save_file = os.path.join(config.model_save_path, f'ckpt_epoch_{epoch}.pth')
@@ -209,8 +227,7 @@ if __name__ == '__main__':
             save_file = os.path.join(config.model_save_path, ckpt)
             save_model(classifier, opt_cls, config, epoch, save_file)
 
-            set_requires_grad(model, True)  # mở lại cho epoch kế tiếp
+            set_requires_grad(model, True)
 
-    # save cuối
     torch.save({'encoder': model.state_dict(), 'classifier': classifier.state_dict()},
                os.path.join(config.model_save_path, f'{config.model_name}_final.pth'))

@@ -139,12 +139,12 @@ if __name__ == '__main__':
 
             L_uni = con_loss(features=feats, labels=y, universum=z_u)
 
-            # Reconstruction (nếu bật)
+            # Reconstruction
             L_rec = 0.0
             if x_hat_q is not None:
                 L_rec = recon_loss(x_hat_q, q)
 
-            # VICReg (nếu bật)
+            # VICReg
             L_vic = 0.0
             if p_q is not None and p_k is not None:
                 L_vic = vicreg_loss(p_q, p_k)
@@ -204,7 +204,6 @@ if __name__ == '__main__':
 
             print(f'[P2] Train CE: {run_ce/max(1,total):.4f} | Acc: {correct/max(1,total):.4f}')
 
-            # Validate ngay sau Phase 2
             _ = evaluate(model, classifier, test_loader, config.device)
 
             save_file = os.path.join(config.model_save_path, f'ckpt_epoch_{epoch}.pth')
@@ -214,7 +213,7 @@ if __name__ == '__main__':
             save_file = os.path.join(config.model_save_path, ckpt)
             save_model(classifier, opt_cls, config, epoch, save_file)
 
-            set_requires_grad(model, True)  # mở lại cho epoch kế tiếp
+            set_requires_grad(model, True)
 
     # save cuối
     torch.save({'encoder': model.state_dict(), 'classifier': classifier.state_dict()},

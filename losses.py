@@ -208,6 +208,18 @@ class UniConLoss_ETD(nn.Module):
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, B).mean()
         return loss
+    
+class ProtoNCELoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, prototypes_layer):
+        prototypes_layer.weight.data = F.normalize(prototypes_layer.weight.data, dim=1)
+        logits = prototypes_layer(features)
+        scores, assigned_idx = torch.max(logits.detach(), dim=1)
+        loss = F.cross_entropy(logits / self.temperature, assigned_idx)
+        return loss
 
 def off_diagonal(x):
     n, m = x.shape
